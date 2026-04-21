@@ -7,6 +7,10 @@
 - 最终打分继续复用官方 `ActionEvaluatorMultiChoice` 的多选 action metric。
 - 推理接口先走 OpenAI 兼容的 `/chat/completions`，方便后面替换成 OpenAI 或兼容服务。
 
+如果你想看这套仓库里当前的历史建模方法总结，见：
+
+- `docs/mind2web_hybrid_history.md`
+
 ## 1. 准备数据
 
 先安装依赖，然后把测试集和官方候选分数下载到本地：

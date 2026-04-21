@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CrossTaskFailureMemory",
+  "description": "Reusable cross-task failure memory item extracted from interactive GUI trajectories.",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "ReusableMemoryCandidate",
+      "type": "object",
+      "required": [
+        "reusable",
+        "memory_type",
+        "error_type",
+        "local_symptom",
+        "likely_cause",
+        "generalizable_rule",
+        "scope",
+        "retrieval_tags",
+        "recoverability",
+        "confidence"
+      ],
+      "properties": {
+        "reusable": {
+          "const": true
+        },
+        "memory_type": {
+          "type": "string",
+          "enum": [
+            "error_pattern",
+            "heuristic",
+            "procedure"
+          ]
+        },
+        "error_type": {
+          "type": "string",
+          "enum": [
+            "wrong_element",
+            "wrong_action",
+            "wrong_value",
+            "wrong_order",
+            "missed_confirmation",
+            "modal_context_ignored",
+            "branch_drift",
+            "background_interaction_under_modal",
+            "decorative_child_selected",
+            "search_not_triggered",
+            "filter_not_applied",
+            "date_or_form_not_confirmed",
+            "other"
+          ]
+        },
+        "local_symptom": {
+          "type": "string",
+          "minLength": 1
+        },
+        "likely_cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generalizable_rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "object",
+          "required": [
+            "domain",
+            "site",
+            "ui_pattern"
+          ],
+          "properties": {
+            "domain": {
+              "type": "string"
+            },
+            "site": {
+              "type": "string"
+            },
+            "ui_pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "retrieval_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "evidence": {
+          "type": "object",
+          "properties": {
+            "step_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "chosen_action": {
+              "type": "string"
+            },
+            "later_symptom": {
+              "type": "string"
+            },
+            "contrast_case": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "recoverability": {
+          "type": "string",
+          "enum": [
+            "recoverable",
+            "hard_drift",
+            "unknown"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "source": {
+          "type": "object",
+          "properties": {
+            "benchmark": {
+              "type": "string"
+            },
+            "website": {
+              "type": "string"
+            },
+            "annotation_id": {
+              "type": "string"
+            },
+            "action_uid": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "NonReusableCandidate",
+      "type": "object",
+      "required": [
+        "reusable",
+        "reason",
+        "confidence"
+      ],
+      "properties": {
+        "reusable": {
+          "const": false
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

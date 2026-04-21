@@ -1,0 +1,74 @@
+[
+  {
+    "memory_id": "heuristic_modal_001",
+    "memory_type": "error_pattern",
+    "scope": {
+      "domain": "generic",
+      "site": "",
+      "ui_pattern": "modal_overlay"
+    },
+    "retrieval_tags": ["modal", "dialog", "overlay", "popup", "confirm"],
+    "generalizable_rule": "When a modal or dialog is visible, prioritize actions inside the modal before interacting with the background page.",
+    "confidence": 0.92
+  },
+  {
+    "memory_id": "heuristic_apply_001",
+    "memory_type": "error_pattern",
+    "scope": {
+      "domain": "generic",
+      "site": "",
+      "ui_pattern": "filter_or_picker_confirmation"
+    },
+    "retrieval_tags": ["apply", "done", "update", "search", "confirm", "filter", "picker"],
+    "generalizable_rule": "After changing a filter, date, passenger count, or option picker, look for an explicit Apply, Done, Update, Continue, or Search confirmation before moving on.",
+    "confidence": 0.9
+  },
+  {
+    "memory_id": "heuristic_clickable_parent_001",
+    "memory_type": "error_pattern",
+    "scope": {
+      "domain": "generic",
+      "site": "",
+      "ui_pattern": "nested_clickable_target"
+    },
+    "retrieval_tags": ["button", "link", "svg", "icon", "span", "div", "parent", "ancestor"],
+    "generalizable_rule": "Prefer semantic clickable ancestors such as buttons or links over decorative child nodes like svg, span, or icon wrappers.",
+    "confidence": 0.88
+  },
+  {
+    "memory_id": "procedure_travel_search_001",
+    "memory_type": "procedure",
+    "scope": {
+      "domain": "travel",
+      "site": "",
+      "ui_pattern": "travel_search_flow"
+    },
+    "retrieval_tags": ["travel", "flight", "hotel", "rental", "search", "date", "passenger", "guest"],
+    "generalizable_rule": "In travel search flows, fill or confirm all required fields such as date, location, guest, or passenger count before triggering the final Search or Continue action.",
+    "confidence": 0.91
+  },
+  {
+    "memory_id": "procedure_checkout_001",
+    "memory_type": "procedure",
+    "scope": {
+      "domain": "shopping",
+      "site": "",
+      "ui_pattern": "checkout_or_form_flow"
+    },
+    "retrieval_tags": ["shopping", "checkout", "form", "payment", "address", "apply", "continue"],
+    "generalizable_rule": "In checkout or reservation forms, complete required inputs first, then handle confirmations such as Apply, Save, or Continue in the active form section.",
+    "confidence": 0.86
+  },
+  {
+    "memory_id": "heuristic_branch_001",
+    "memory_type": "heuristic",
+    "scope": {
+      "domain": "generic",
+      "site": "",
+      "ui_pattern": "branch_stability"
+    },
+    "retrieval_tags": ["continue", "branch", "subflow", "active", "current section"],
+    "generalizable_rule": "When the UI has clearly moved into a new local subflow, prefer actions that continue the active branch instead of jumping back to unrelated controls.",
+    "confidence": 0.84
+  }
+]

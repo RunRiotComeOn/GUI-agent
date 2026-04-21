@@ -1,8 +1,14 @@
 .DS_store
 .idea
+.env
+.env.*
 *.ipynb
 *.pyc
 test_config.yaml
 test.sh
 data/
 outputs/
+.codex
+.claude/
+tmp_*.txt
+*.sbatch

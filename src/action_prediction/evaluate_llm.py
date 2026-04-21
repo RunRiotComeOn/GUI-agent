@@ -3,6 +3,7 @@ import time
 
 import backoff
 import openai
+from dotenv import load_dotenv
 from openai.error import (
     APIConnectionError,
     APIError,
@@ -10,6 +11,8 @@ from openai.error import (
     ServiceUnavailableError,
 )
 from transformers import GPT2TokenizerFast
+
+load_dotenv()
 
 
 class Engine:

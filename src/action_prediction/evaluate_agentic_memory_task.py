@@ -10,11 +10,14 @@ import re
 import time
 
 import requests
+from dotenv import load_dotenv
 from requests import RequestException
 
 from dataloader import format_input_multichoice
 from metric import ActionEvaluatorMultiChoice
 from multimodal_utils import attach_candidate_ranks, image_to_chat_content, load_multimodal_samples
+
+load_dotenv()
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -360,7 +363,7 @@ def summarize_prefix_if_needed(engine, task, older_summary, recent_buffer, keep_
     }
 
 
-def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
+def build_memory_state_for_sample(sample, memory_engine, keep_recent_items=3):
     older_summary = ""
     recent_buffer = []
     traces = []
@@ -400,6 +403,11 @@ def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
         memory_item = {
             "item_type": item["item_type"],
             "change": item["change"].strip(),
+            "element": (item.get("element") or "").strip(),
+            "action_type": (item.get("action_type") or "").strip(),
+            "action_value": (item.get("action_value") or "").strip(),
+            "focus_after": (item.get("focus_after") or "").strip(),
+            "next_goal": (item.get("next_goal") or "").strip(),
             "keep_image": bool(item.get("keep_image", False)),
             "action": (item.get("action") or "").strip(),
             "image_step_index": idx + 1 if bool(item.get("keep_image", False)) else None,
@@ -421,6 +429,11 @@ def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
                 "memory_item": {
                     "item_type": memory_item["item_type"],
                     "change": memory_item["change"],
+                    "element": memory_item["element"],
+                    "action_type": memory_item["action_type"],
+                    "action_value": memory_item["action_value"],
+                    "focus_after": memory_item["focus_after"],
+                    "next_goal": memory_item["next_goal"],
                     "keep_image": memory_item["keep_image"],
                     "action": memory_item["action"],
                     "image_step_index": memory_item["image_step_index"],
@@ -431,6 +444,11 @@ def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
                     {
                         "item_type": x["item_type"],
                         "change": x["change"],
+                        "element": x["element"],
+                        "action_type": x["action_type"],
+                        "action_value": x["action_value"],
+                        "focus_after": x["focus_after"],
+                        "next_goal": x["next_goal"],
                         "keep_image": x["keep_image"],
                         "action": x["action"],
                         "image_step_index": x["image_step_index"],
@@ -439,6 +457,15 @@ def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
                 ],
             }
         )
+    return older_summary, recent_buffer, traces
+
+
+def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
+    older_summary, recent_buffer, traces = build_memory_state_for_sample(
+        sample=sample,
+        memory_engine=memory_engine,
+        keep_recent_items=keep_recent_items,
+    )
     lines = []
     if older_summary:
         lines.append("[older_summary]")

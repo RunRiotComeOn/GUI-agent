@@ -15,13 +15,39 @@ from requests import RequestException
 
 from dataloader import format_input_multichoice
 from metric import ActionEvaluatorMultiChoice
-from multimodal_utils import attach_candidate_ranks, image_to_chat_content, load_multimodal_samples
+from multimodal_utils import (
+    aitw_action_match,
+    attach_candidate_ranks,
+    build_aitw_action_description,
+    image_to_chat_content,
+    load_multimodal_samples,
+    parse_aitw_action_prediction,
+)
 
 load_dotenv()
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+
+AITW_TASK_AGENT_SYSTEM = """You are the task agent in a GUI agentic system for Android in the Wild.
+Predict the next mobile action from the screenshot, task, and rolling memory.
+
+Output strict JSON only:
+{
+  "action_type": "dual_point" | "type" | "go_back" | "go_home" | "enter" | "task_complete" | "task_impossible",
+  "touch_point": [y, x] | null,
+  "lift_point": [y, x] | null,
+  "typed_text": "<text or empty string>"
+}
+
+Rules:
+- Coordinates are normalized [0, 1].
+- Use `dual_point` for taps and drags/swipes.
+- For non-gesture actions set touch_point and lift_point to null.
+- Output JSON only. No markdown fences. No explanation.
+"""
 
 
 MEMORY_AGENT_SYSTEM = """You are the memory agent in a GUI agentic system.
@@ -49,7 +75,7 @@ Output strict JSON only with this schema:
   "item_type": "recent_change" | "recent_change_keyframe",
   "change": "<very short visible state change>",
   "element": "<very short acted-on element description>",
-  "action_type": "CLICK" | "SELECT" | "TYPE" | "",
+  "action_type": "CLICK" | "SELECT" | "TYPE" | "DUAL_POINT" | "GO_BACK" | "GO_HOME" | "ENTER" | "TASK_COMPLETE" | "TASK_IMPOSSIBLE" | "",
   "action_value": "<typed/selected value or empty string>",
   "focus_after": "<current active UI sub-flow after this step>",
   "next_goal": "<the next immediate local target implied by the UI, not the whole task>",
@@ -61,6 +87,8 @@ Good style examples:
 - `"change": "truck options appear with pricing", "element": "Find Your Truck button", "action_type": "CLICK", "focus_after": "truck options", "next_goal": "choose the correct truck card"`
 - `"change": "email field becomes filled", "element": "email input", "action_type": "TYPE", "action_value": "jame_jones@hotmail.com", "focus_after": "checkout form", "next_goal": "fill the next required input"`
 - `"change": "location step becomes active", "element": "Continue to Location button", "action_type": "CLICK", "focus_after": "location continuation", "next_goal": "continue within location flow, not add-ons"`
+- `"change": "screen scrolls down to more settings", "element": "settings list", "action_type": "DUAL_POINT", "focus_after": "settings list", "next_goal": "tap the correct settings row"`
+- `"change": "previous screen returns", "element": "system back", "action_type": "GO_BACK", "focus_after": "previous page", "next_goal": "continue from the previous screen"`
 
 Bad style examples:
 - `"change": "the user moved further in the flow"`
@@ -481,6 +509,27 @@ def build_memory_for_sample(sample, memory_engine, keep_recent_items=3):
 
 class AgenticMemoryTaskEvaluator(ActionEvaluatorMultiChoice):
     @staticmethod
+    def _build_aitw_result_summary(all_step_scores, sample_to_website):
+        macro_step_acc = collections.defaultdict(list)
+        for score, annotation_id in all_step_scores:
+            macro_step_acc[annotation_id].append(score)
+        acc_per_website = collections.defaultdict(list)
+        for annotation_id, values in macro_step_acc.items():
+            acc_per_website[sample_to_website[annotation_id]].append(sum(values) / len(values))
+        partial_match = sum(score for score, _ in all_step_scores) / max(len(all_step_scores), 1)
+        complete_match = (
+            sum(1 for values in macro_step_acc.values() if values and min(values) == 1.0)
+            / max(len(macro_step_acc), 1)
+        )
+        return {
+            "partial_match": partial_match,
+            "complete_match": complete_match,
+            "step_acc": partial_match,
+            "episode_count": len(macro_step_acc),
+            "acc_per_website": {k: (sum(v) / len(v), len(v)) for k, v in acc_per_website.items()},
+        }
+
+    @staticmethod
     def _build_result_summary(
         all_element_acc,
         all_action_f1,
@@ -552,6 +601,15 @@ class AgenticMemoryTaskEvaluator(ActionEvaluatorMultiChoice):
         name="default",
         keep_recent_items=3,
     ):
+        if dataset.data and dataset.data[0].get("action_space") == "aitw":
+            return self.evaluate_dataset_aitw(
+                dataset=dataset,
+                task_engine=task_engine,
+                memory_engine=memory_engine,
+                output_path=output_path,
+                name=name,
+                keep_recent_items=keep_recent_items,
+            )
         all_element_acc = []
         all_action_f1 = []
         all_step_acc = []
@@ -676,6 +734,107 @@ class AgenticMemoryTaskEvaluator(ActionEvaluatorMultiChoice):
             self._write_outputs(output_path, name, top_k, all_predictions, all_outputs, result)
         return result
 
+    def evaluate_dataset_aitw(
+        self,
+        dataset,
+        task_engine,
+        memory_engine,
+        output_path=None,
+        name="default",
+        keep_recent_items=3,
+    ):
+        all_step_scores = []
+        sample_to_website = {}
+        all_predictions = []
+        all_outputs = []
+
+        for sample in dataset.data:
+            annotation_id = sample["annotation_id"]
+            sample_id = f"{sample['annotation_id']}_{sample['action_uid']}"
+            sample_to_website[annotation_id] = sample["website"]
+
+            memory_text, memory_images, memory_trace = build_memory_for_sample(
+                sample=sample,
+                memory_engine=memory_engine,
+                keep_recent_items=keep_recent_items,
+            )
+            ui_lines = []
+            for item in (sample.get("ui_elements") or [])[:15]:
+                ui_lines.append(f"- {item}")
+            task_text = [
+                f"Task: {sample.get('confirmed_task', '')}",
+                f"Current activity: {sample.get('current_activity', '')}",
+                f"Device: {sample.get('device_type', '')}",
+            ]
+            if ui_lines:
+                task_text.append("Detected UI text/icons:")
+                task_text.extend(ui_lines)
+            user_text = "\n".join(task_text)
+            if memory_text:
+                user_text = f"{memory_text}\n\n{user_text}"
+
+            content_blocks = []
+            for memory_image in memory_images:
+                content_blocks.append(image_to_chat_content(memory_image))
+            if sample.get("screenshot") is not None:
+                content_blocks.append(image_to_chat_content(sample["screenshot"]))
+            content_blocks.append({"type": "text", "text": f"{user_text}\n\nPredict the next action now."})
+            raw_output = task_engine.chat_with_image_list(
+                system_prompt=AITW_TASK_AGENT_SYSTEM,
+                content_blocks=content_blocks,
+                max_tokens=220,
+            )
+            try:
+                parsed_output = parse_aitw_action_prediction(raw_output)
+                step_score = aitw_action_match(parsed_output, sample["ground_truth_action"])
+            except Exception as exc:
+                parsed_output = {
+                    "action_type": "invalid",
+                    "touch_point": None,
+                    "lift_point": None,
+                    "typed_text": "",
+                }
+                step_score = 0.0
+                logger.warning("Failed to parse AITW task-agent output for sample=%s: %s", sample_id, exc)
+
+            all_step_scores.append([step_score, annotation_id])
+            all_predictions.append([sample_id, parsed_output, sample["ground_truth_action"], step_score])
+            all_outputs.append(
+                [
+                    sample_id,
+                    {
+                        "memory_trace": memory_trace,
+                        "memory_text": memory_text,
+                        "memory_image_count": len(memory_images),
+                        "ground_truth": build_aitw_action_description(sample["ground_truth_action"]),
+                        "model_output": raw_output,
+                        "parsed_prediction": parsed_output,
+                        "step_score": step_score,
+                    },
+                ]
+            )
+
+            if output_path is not None:
+                result = self._build_aitw_result_summary(all_step_scores, sample_to_website)
+                os.makedirs(output_path, exist_ok=True)
+                with open(f"{output_path}/{name}_predictions_top0.json", "w", encoding="utf-8") as f:
+                    json.dump(all_predictions, f, indent=2, ensure_ascii=False)
+                with open(f"{output_path}/{name}_results_top0.json", "w", encoding="utf-8") as f:
+                    json.dump(result, f, indent=4)
+                with open(f"{output_path}/{name}_outputs_top0.json", "w", encoding="utf-8") as f:
+                    json.dump(all_outputs, f, indent=2, ensure_ascii=False)
+
+        result = self._build_aitw_result_summary(all_step_scores, sample_to_website)
+        if output_path is not None:
+            os.makedirs(output_path, exist_ok=True)
+            with open(f"{output_path}/{name}_predictions_top0.json", "w", encoding="utf-8") as f:
+                json.dump(all_predictions, f, indent=2, ensure_ascii=False)
+            with open(f"{output_path}/{name}_results_top0.json", "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=4)
+            with open(f"{output_path}/{name}_outputs_top0.json", "w", encoding="utf-8") as f:
+                json.dump(all_outputs, f, indent=2, ensure_ascii=False)
+        return result
+
 
 def load_prompt_template(prompt_file: str):
     with open(prompt_file, "r", encoding="utf-8") as f:
@@ -690,10 +849,11 @@ def load_ids_from_file(path: str | None) -> list[str]:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a memory-agent + task-agent GUI system on static Mind2Web.")
+    parser = argparse.ArgumentParser(description="Evaluate a memory-agent + task-agent GUI system on supported static GUI datasets.")
     parser.add_argument("--dataset-path", default="data/multimodal_mind2web")
+    parser.add_argument("--dataset-format", default="auto", choices=["auto", "mind2web", "aitw"])
     parser.add_argument("--score-file", default="data/mind2web_aux/scores_all_data.pkl")
-    parser.add_argument("--split", default="test_task", choices=["test_task", "test_website", "test_domain", "all"])
+    parser.add_argument("--split", default="test_task")
     parser.add_argument("--output-dir", default="outputs/agentic_memory_task")
     parser.add_argument("--prompt-file", default="src/action_prediction/llm_prompt.json")
     parser.add_argument("--task-model", default="gpt-4o-mini")
@@ -717,9 +877,12 @@ def main():
         dataset_path=args.dataset_path,
         split=args.split,
         action_uids=action_uids,
+        dataset_format=args.dataset_format,
     )
-    with open(args.score_file, "rb") as f:
-        candidate_results = pickle.load(f)
+    candidate_results = None
+    if samples and samples[0].get("action_space") == "mind2web":
+        with open(args.score_file, "rb") as f:
+            candidate_results = pickle.load(f)
     samples = attach_candidate_ranks(samples, candidate_results)
     dataset = StaticDataset(samples)
 

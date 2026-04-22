@@ -16,9 +16,12 @@ from dotenv import load_dotenv
 from requests import RequestException
 from metric import ActionEvaluatorMultiChoice
 from multimodal_utils import (
+    aitw_action_match,
     attach_candidate_ranks,
+    build_aitw_action_description,
     image_to_chat_content,
     load_multimodal_samples,
+    parse_aitw_action_prediction,
 )
 from evaluate_agentic_memory_task import (
     OpenAICompatibleEngine,
@@ -37,6 +40,28 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+
+AITW_SYSTEM_PROMPT = """You are a mobile GUI agent for Android in the Wild.
+
+Given the current Android screenshot, the user goal, and optional short history,
+predict the next action in the AITW offline format.
+
+Return strict JSON only:
+{
+  "action_type": "dual_point" | "type" | "go_back" | "go_home" | "enter" | "task_complete" | "task_impossible",
+  "touch_point": [y, x] | null,
+  "lift_point": [y, x] | null,
+  "typed_text": "<text or empty string>"
+}
+
+Rules:
+- Coordinates must be normalized to [0, 1].
+- Use `dual_point` for taps and drags/swipes.
+- For taps, set touch_point and lift_point to nearly the same location.
+- For non-gesture actions, set touch_point and lift_point to null.
+- Output JSON only. No markdown fences. No explanation.
+"""
 
 
 class StaticDataset:
@@ -292,6 +317,156 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
             history_text = history_text[:history_text_char_budget].rstrip() + "\n[history truncated]"
         return history_text, recent_steps, memory_images
 
+    @staticmethod
+    def build_aitw_user_text(sample, history_text="") -> str:
+        lines = [
+            f"Task: {sample.get('confirmed_task', '')}",
+            f"Current activity: {sample.get('current_activity', '')}",
+            f"Device: {sample.get('device_type', '')}",
+        ]
+        ui_elements = sample.get("ui_elements") or []
+        if ui_elements:
+            lines.append("Detected UI text/icons:")
+            for item in ui_elements[:15]:
+                lines.append(f"- {item}")
+        if history_text:
+            lines.append("")
+            lines.append(history_text)
+        lines.append("")
+        lines.append("Predict the next action now.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def build_aitw_result_summary(all_step_scores, sample_to_website):
+        macro_step_acc = collections.defaultdict(list)
+        for score, annotation_id in all_step_scores:
+            macro_step_acc[annotation_id].append(score)
+        acc_per_website = collections.defaultdict(list)
+        for annotation_id, values in macro_step_acc.items():
+            acc_per_website[sample_to_website[annotation_id]].append(sum(values) / len(values))
+        partial_match = sum(score for score, _ in all_step_scores) / max(len(all_step_scores), 1)
+        complete_match = (
+            sum(1 for values in macro_step_acc.values() if values and min(values) == 1.0)
+            / max(len(macro_step_acc), 1)
+        )
+        return {
+            "partial_match": partial_match,
+            "complete_match": complete_match,
+            "step_acc": partial_match,
+            "episode_count": len(macro_step_acc),
+            "acc_per_website": {k: (sum(v) / len(v), len(v)) for k, v in acc_per_website.items()},
+        }
+
+    def evaluate_dataset_aitw_vlm(
+        self,
+        dataset,
+        model,
+        output_path=None,
+        name="default",
+        use_image=True,
+        history_mode="none",
+        history_text_char_budget=24000,
+        recent_k=3,
+        recent_k_policy="fixed",
+        memory_engine=None,
+    ):
+        all_step_scores = []
+        sample_to_website = {}
+        all_predictions = []
+        all_outputs = []
+        for sample in dataset.data:
+            annotation_id = sample["annotation_id"]
+            sample_id = f"{sample['annotation_id']}_{sample['action_uid']}"
+            sample_to_website[annotation_id] = sample["website"]
+
+            history_images = []
+            history_text = ""
+            selected_previous_steps = self.select_previous_steps(
+                sample, history_mode if history_mode != "text_only" else "recent", recent_k, recent_k_policy
+            )
+            if history_mode == "agentic_summary_recent":
+                if memory_engine is None:
+                    raise ValueError("memory_engine is required for history_mode=agentic_summary_recent")
+                history_text, _, history_images = self.build_agentic_summary_plus_recent_history(
+                    sample=sample,
+                    memory_engine=memory_engine,
+                    history_text_char_budget=history_text_char_budget,
+                    recent_k=recent_k,
+                    recent_k_policy=recent_k_policy,
+                )
+            elif history_mode != "none":
+                lines = ["Recent interaction history:"]
+                for idx, previous_step in enumerate(selected_previous_steps, start=1):
+                    lines.append(f"Step {idx}: {previous_step.get('action_repr', '')}")
+                history_text = "\n".join(lines)
+                if history_text_char_budget and len(history_text) > history_text_char_budget:
+                    history_text = history_text[:history_text_char_budget].rstrip() + "\n[history truncated]"
+                if use_image and history_mode == "full":
+                    history_images = [
+                        step["screenshot"]
+                        for step in selected_previous_steps
+                        if step.get("screenshot") is not None
+                    ]
+
+            prompt = [
+                {"role": "system", "content": AITW_SYSTEM_PROMPT},
+                {"role": "user", "content": self.build_aitw_user_text(sample, history_text=history_text)},
+            ]
+            raw_output = model.generate(
+                prompt=prompt,
+                max_new_tokens=220,
+                image=sample.get("screenshot") if use_image else None,
+                history_images=history_images,
+            )[0]
+            try:
+                parsed_output = parse_aitw_action_prediction(raw_output)
+                step_score = aitw_action_match(parsed_output, sample["ground_truth_action"])
+            except Exception as exc:
+                parsed_output = {
+                    "action_type": "invalid",
+                    "touch_point": None,
+                    "lift_point": None,
+                    "typed_text": "",
+                }
+                step_score = 0.0
+                logger.warning("Failed to parse AITW prediction for sample=%s: %s", sample_id, exc)
+
+            all_step_scores.append([step_score, annotation_id])
+            all_predictions.append(
+                [
+                    sample_id,
+                    parsed_output,
+                    sample["ground_truth_action"],
+                    step_score,
+                ]
+            )
+            all_outputs.append(
+                [
+                    sample_id,
+                    {
+                        "history_mode": history_mode,
+                        "history_text": history_text,
+                        "history_image_count": len(history_images),
+                        "ui_elements": sample.get("ui_elements", [])[:15],
+                        "ground_truth": build_aitw_action_description(sample["ground_truth_action"]),
+                        "model_output": raw_output,
+                        "parsed_prediction": parsed_output,
+                        "step_score": step_score,
+                    },
+                ]
+            )
+
+        result = self.build_aitw_result_summary(all_step_scores, sample_to_website)
+        if output_path is not None:
+            os.makedirs(output_path, exist_ok=True)
+            with open(f"{output_path}/{name}_predictions_top0.json", "w", encoding="utf-8") as f:
+                json.dump(all_predictions, f, indent=2, ensure_ascii=False)
+            with open(f"{output_path}/{name}_results_top0.json", "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=4)
+            with open(f"{output_path}/{name}_outputs_top0.json", "w", encoding="utf-8") as f:
+                json.dump(all_outputs, f, indent=2, ensure_ascii=False)
+        return result
+
     def evaluate_dataset_vlm(
         self,
         dataset,
@@ -312,6 +487,19 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
         experience_library=None,
         experience_selector_engine=None,
     ):
+        if dataset.data and dataset.data[0].get("action_space") == "aitw":
+            return self.evaluate_dataset_aitw_vlm(
+                dataset=dataset,
+                model=model,
+                output_path=output_path,
+                name=name,
+                use_image=use_image,
+                history_mode=history_mode,
+                history_text_char_budget=history_text_char_budget,
+                recent_k=recent_k,
+                recent_k_policy=recent_k_policy,
+                memory_engine=memory_engine,
+            )
         all_element_acc = []
         all_action_f1 = []
         all_step_acc = []
@@ -603,11 +791,12 @@ def load_ids_from_file(path: str | None) -> list[str]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate an OpenAI-compatible VLM on static Multimodal-Mind2Web using the official Mind2Web action metric."
+        description="Evaluate an OpenAI-compatible VLM on supported static GUI datasets."
     )
     parser.add_argument("--dataset-path", default="data/multimodal_mind2web")
+    parser.add_argument("--dataset-format", default="auto", choices=["auto", "mind2web", "aitw"])
     parser.add_argument("--score-file", default="data/mind2web_aux/scores_all_data.pkl")
-    parser.add_argument("--split", default="test_task", choices=["test_task", "test_website", "test_domain", "all"])
+    parser.add_argument("--split", default="test_task")
     parser.add_argument("--output-dir", default="outputs/mind2web_vlm")
     parser.add_argument("--prompt-file", default="src/action_prediction/llm_prompt.json")
     parser.add_argument("--model", default="gpt-4o-mini")
@@ -671,6 +860,7 @@ def main():
         action_uids=action_uids,
         websites=args.website,
         domains=args.domain,
+        dataset_format=args.dataset_format,
     )
     logger.info("Selected %s action samples from split=%s", len(samples), args.split)
     if samples:
@@ -684,8 +874,10 @@ def main():
     if args.dry_run:
         return
 
-    with open(args.score_file, "rb") as f:
-        candidate_results = pickle.load(f)
+    candidate_results = None
+    if samples and samples[0].get("action_space") == "mind2web":
+        with open(args.score_file, "rb") as f:
+            candidate_results = pickle.load(f)
     samples = attach_candidate_ranks(samples, candidate_results)
 
     prompt_template = load_prompt_template(args.prompt_file)

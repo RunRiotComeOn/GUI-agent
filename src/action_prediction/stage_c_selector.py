@@ -9,7 +9,7 @@ Exposes:
       -> {"experience_id": str|None, "reason": str, "injection": str|None}
   - render_experience_slot(record) -> str
 
-CLI mode runs a dry-run on N random Mind2Web samples and prints what the
+CLI mode runs a dry-run on N random static GUI samples and prints what the
 selector picks.
 """
 
@@ -178,10 +178,19 @@ def load_library_by_id(path: Path) -> dict[str, dict]:
 
 
 def build_context_for_sample(sample: dict) -> tuple[str, list[dict], str]:
-    """Turn one Mind2Web sample into (task, recent_steps, current_obs)."""
+    """Turn one static GUI sample into (task, recent_steps, current_obs)."""
     task = sample.get("confirmed_task", "")
     previous = sample.get("previous_actions", [])[-3:]
     recent_steps = [{"action": repr_text} for repr_text in previous]
+
+    if sample.get("action_space") == "aitw":
+        ui_elements = sample.get("ui_elements") or []
+        current_obs = (
+            f"activity={sample.get('current_activity', '')} "
+            f"device={sample.get('device_type', '')} "
+            f"ui_hint=[{'; '.join(ui_elements[:8])}]"
+        )
+        return task, recent_steps, current_obs
 
     pos = sample.get("pos_candidates") or []
     element_hint = ""
@@ -218,7 +227,7 @@ def build_context_for_sample(sample: dict) -> tuple[str, list[dict], str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Stage C selector — dry-run on Mind2Web.")
+    parser = argparse.ArgumentParser(description="Stage C selector — dry-run on static GUI datasets.")
     parser.add_argument(
         "--catalog",
         default="outputs/cross_task_experience/catalog_4o_v3.json",
@@ -228,10 +237,10 @@ def main(argv: list[str] | None = None) -> int:
         default="outputs/cross_task_experience/experience_library_4o_v3.jsonl",
     )
     parser.add_argument("--dataset-path", default="data/multimodal_mind2web")
+    parser.add_argument("--dataset-format", default="auto", choices=["auto", "mind2web", "aitw"])
     parser.add_argument(
         "--split",
         default="test_task",
-        choices=["test_task", "test_website", "test_domain", "all"],
     )
     parser.add_argument("--n-samples", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
@@ -250,7 +259,11 @@ def main(argv: list[str] | None = None) -> int:
     library = load_library_by_id(Path(args.library))
     logger.info("loaded catalog size=%d library size=%d", len(catalog), len(library))
 
-    samples = load_multimodal_samples(dataset_path=args.dataset_path, split=args.split)
+    samples = load_multimodal_samples(
+        dataset_path=args.dataset_path,
+        split=args.split,
+        dataset_format=args.dataset_format,
+    )
     rng = random.Random(args.seed)
     sampled = rng.sample(samples, min(args.n_samples, len(samples)))
     logger.info("sampled %d steps from split=%s", len(sampled), args.split)

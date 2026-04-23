@@ -369,11 +369,15 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
         recent_k=3,
         recent_k_policy="fixed",
         memory_engine=None,
+        experience_catalog=None,
+        experience_library=None,
+        experience_selector_engine=None,
     ):
         all_step_scores = []
         sample_to_website = {}
         all_predictions = []
         all_outputs = []
+        all_experience_selections = []
         for sample in dataset.data:
             annotation_id = sample["annotation_id"]
             sample_id = f"{sample['annotation_id']}_{sample['action_uid']}"
@@ -407,6 +411,41 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
                         for step in selected_previous_steps
                         if step.get("screenshot") is not None
                     ]
+
+            active_experience_text = ""
+            experience_selection = {"experience_id": None, "reason": "", "injection": None}
+            if experience_catalog and experience_library and experience_selector_engine is not None:
+                sel_task, sel_recent, sel_obs = build_context_for_sample(sample)
+                try:
+                    experience_selection = select_experience(
+                        engine=experience_selector_engine,
+                        task=sel_task,
+                        recent_steps=sel_recent,
+                        current_obs=sel_obs,
+                        catalog=experience_catalog,
+                        library=experience_library,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "experience selector failed on annotation=%s action=%s: %s",
+                        sample.get("annotation_id"), sample.get("action_uid"), exc,
+                    )
+                if experience_selection.get("injection"):
+                    active_experience_text = experience_selection["injection"]
+                    history_text = (
+                        f"{history_text}\n\n{active_experience_text}"
+                        if history_text
+                        else active_experience_text
+                    )
+            all_experience_selections.append(
+                {
+                    "annotation_id": sample["annotation_id"],
+                    "action_uid": sample["action_uid"],
+                    "target_action_index": sample.get("target_action_index"),
+                    "experience_id": experience_selection.get("experience_id"),
+                    "reason": experience_selection.get("reason", ""),
+                }
+            )
 
             prompt = [
                 {"role": "system", "content": AITW_SYSTEM_PROMPT},
@@ -447,6 +486,8 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
                         "history_mode": history_mode,
                         "history_text": history_text,
                         "history_image_count": len(history_images),
+                        "experience_id": experience_selection.get("experience_id"),
+                        "experience_reason": experience_selection.get("reason", ""),
                         "ui_elements": sample.get("ui_elements", [])[:15],
                         "ground_truth": build_aitw_action_description(sample["ground_truth_action"]),
                         "model_output": raw_output,
@@ -465,6 +506,16 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
                 json.dump(result, f, indent=4)
             with open(f"{output_path}/{name}_outputs_top0.json", "w", encoding="utf-8") as f:
                 json.dump(all_outputs, f, indent=2, ensure_ascii=False)
+            if all_experience_selections and any(
+                item.get("experience_id") is not None or item.get("reason")
+                for item in all_experience_selections
+            ):
+                with open(
+                    f"{output_path}/{name}_experience_selections_top0.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(all_experience_selections, f, indent=2, ensure_ascii=False)
         return result
 
     def evaluate_dataset_vlm(
@@ -499,6 +550,9 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
                 recent_k=recent_k,
                 recent_k_policy=recent_k_policy,
                 memory_engine=memory_engine,
+                experience_catalog=experience_catalog,
+                experience_library=experience_library,
+                experience_selector_engine=experience_selector_engine,
             )
         all_element_acc = []
         all_action_f1 = []

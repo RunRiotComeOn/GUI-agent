@@ -12,3 +12,4 @@ outputs/
 .claude/
 tmp_*.txt
 *.sbatch
+_pycache_/

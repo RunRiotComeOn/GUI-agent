@@ -157,6 +157,12 @@ def render_experience_slot(record: dict) -> str:
         f"When it applies: {record['applicable_context']['when']}",
         f"Guidance: {record['action_guidance']}",
     ]
+    if record.get("trigger_ui_state"):
+        lines.append(f"Trigger UI state: {record['trigger_ui_state']}")
+    if record.get("forbidden_alternative"):
+        lines.append(f"Avoid: {record['forbidden_alternative']}")
+    if record.get("expected_postcondition"):
+        lines.append(f"Expected after action: {record['expected_postcondition']}")
     templates = record.get("action_templates") or []
     if templates:
         lines.append("Suggested action shapes:")

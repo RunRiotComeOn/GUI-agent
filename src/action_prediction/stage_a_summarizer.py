@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 
-REQUIRED_FIELDS = (
+V1_REQUIRED_FIELDS = (
     "goal",
     "key_trajectory",
     "skill_effectiveness",
@@ -42,7 +42,7 @@ REQUIRED_FIELDS = (
 SKILL_LABELS = {"decisive", "necessary", "redundant"}
 
 
-SYSTEM_PROMPT = """You are a trajectory summarizer for GUI agents on offline static GUI trajectories.
+V1_SYSTEM_PROMPT = """You are a trajectory summarizer for GUI agents on offline static GUI trajectories.
 
 You receive one successful task trajectory (every step is a ground-truth
 target action). Your job is to compress the event stream into an
@@ -81,7 +81,7 @@ Grounding rules:
 """
 
 
-USER_PROMPT_TEMPLATE = """Task:
+V1_USER_PROMPT_TEMPLATE = """Task:
 {task}
 
 Website: {website}
@@ -92,6 +92,91 @@ Steps:
 {steps_block}
 
 Emit the causal summary JSON now."""
+
+
+V2_REQUIRED_FIELDS = (
+    "goal",
+    "task_shape",
+    "turning_points",
+    "rejected_branches",
+    "outcome",
+)
+
+V2_TURNING_POINT_REQUIRED_FIELDS = (
+    "step",
+    "pre_state",
+    "action",
+    "commit_signal",
+    "post_state",
+    "failure_if_skipped",
+    "generalizable_pattern",
+)
+
+V2_SYSTEM_PROMPT = """You are extracting reusable GUI interaction experience from one successful offline GUI trajectory.
+
+Do NOT summarize the whole task. Keep ONLY transitions that teach a
+transferable GUI interaction rule.
+
+Emit strict JSON only. No markdown fences. No extra commentary.
+
+Required fields:
+- goal: the abstracted task intent. Remove one-off values like site name,
+  exact dates, person names, or exact locations.
+- task_shape: one short label describing the task family. Prefer one of:
+  "search", "filter", "form", "checkout", "navigation", "booking",
+  "account", "content", or "other".
+- turning_points: list of high-value transition objects. Keep only steps
+  that prevent a concrete GUI mistake. Every turning point MUST contain:
+  - step: 1-based step index
+  - pre_state: {
+      "ui_context": short phrase for the active UI state or surface,
+      "active_subflow": short phrase for the current subflow,
+      "recent_user_commit": what value/selection was just changed, if any,
+      "pending_commit": true/false for whether state still needed explicit confirmation
+    }
+  - action: {
+      "op": CLICK|TYPE|SELECT|HOVER|PRESS_ENTER|OTHER,
+      "target": short visible target description,
+      "target_role": button|link|input|dropdown|modal|background|other
+    }
+  - commit_signal: list of concrete visual/structural cues that made this
+    action correct now
+  - post_state: {
+      "state_change": what became committed or disambiguated,
+      "subflow_status": stayed_active|advanced|closed|returned|other
+    }
+  - failure_if_skipped: one concrete mistake a plausible GUI agent would make
+  - generalizable_pattern: short snake_case style pattern name
+- rejected_branches: short strings naming tempting but wrong alternatives
+  that were avoided in this trajectory. Use [] if none.
+- outcome: one sentence attributing success to the key turning points.
+
+Selection rules:
+- Reject plain task-progress steps like "clicked search result" unless they
+  teach a transferable interaction rule.
+- Prefer steps involving confirmation, modal discipline, branch control,
+  autocomplete commitment, filter application, required-field completion,
+  or other GUI-specific state transitions.
+- If a step is only important because the task needed to progress, do not keep it.
+
+Grounding rules:
+- Do not invent UI states or signals not supported by the input.
+- Do not copy long raw attributes or coordinates.
+- If there are no reusable turning points, return an empty turning_points list.
+"""
+
+
+V2_USER_PROMPT_TEMPLATE = """Task:
+{task}
+
+Website: {website}
+Domain: {domain}
+Subdomain: {subdomain}
+
+Steps:
+{steps_block}
+
+Emit the experience-oriented summary JSON now."""
 
 
 def _load_stage_a_samples(
@@ -205,9 +290,9 @@ def _extract_json_object(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def _validate_summary(summary: dict) -> list[str]:
+def _validate_v1_summary(summary: dict) -> list[str]:
     errors: list[str] = []
-    for field in REQUIRED_FIELDS:
+    for field in V1_REQUIRED_FIELDS:
         if field not in summary:
             errors.append(f"missing field: {field}")
     if errors:
@@ -250,27 +335,112 @@ def _validate_summary(summary: dict) -> list[str]:
     return errors
 
 
+def _validate_v2_summary(summary: dict) -> list[str]:
+    errors: list[str] = []
+    for field in V2_REQUIRED_FIELDS:
+        if field not in summary:
+            errors.append(f"missing field: {field}")
+    if errors:
+        return errors
+
+    if not isinstance(summary["goal"], str) or not summary["goal"].strip():
+        errors.append("goal must be a non-empty string")
+
+    if not isinstance(summary["task_shape"], str) or not summary["task_shape"].strip():
+        errors.append("task_shape must be a non-empty string")
+
+    turning_points = summary["turning_points"]
+    if not isinstance(turning_points, list):
+        errors.append("turning_points must be a list")
+    else:
+        for i, entry in enumerate(turning_points):
+            if not isinstance(entry, dict):
+                errors.append(f"turning_points[{i}] must be an object")
+                continue
+            for key in V2_TURNING_POINT_REQUIRED_FIELDS:
+                if key not in entry:
+                    errors.append(f"turning_points[{i}].{key} missing")
+            pre_state = entry.get("pre_state")
+            if not isinstance(pre_state, dict):
+                errors.append(f"turning_points[{i}].pre_state must be an object")
+            else:
+                for key in ("ui_context", "active_subflow", "recent_user_commit", "pending_commit"):
+                    if key not in pre_state:
+                        errors.append(f"turning_points[{i}].pre_state.{key} missing")
+                if "pending_commit" in pre_state and not isinstance(pre_state["pending_commit"], bool):
+                    errors.append(f"turning_points[{i}].pre_state.pending_commit must be bool")
+
+            action = entry.get("action")
+            if not isinstance(action, dict):
+                errors.append(f"turning_points[{i}].action must be an object")
+            else:
+                for key in ("op", "target", "target_role"):
+                    if key not in action or action[key] in (None, "", []):
+                        errors.append(f"turning_points[{i}].action.{key} missing or empty")
+
+            commit_signal = entry.get("commit_signal")
+            if not isinstance(commit_signal, list):
+                errors.append(f"turning_points[{i}].commit_signal must be a list")
+
+            post_state = entry.get("post_state")
+            if not isinstance(post_state, dict):
+                errors.append(f"turning_points[{i}].post_state must be an object")
+            else:
+                for key in ("state_change", "subflow_status"):
+                    if key not in post_state or post_state[key] in (None, "", []):
+                        errors.append(f"turning_points[{i}].post_state.{key} missing or empty")
+
+            for key in ("failure_if_skipped", "generalizable_pattern"):
+                value = entry.get(key, "")
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(f"turning_points[{i}].{key} must be non-empty string")
+
+    rejected_branches = summary["rejected_branches"]
+    if not isinstance(rejected_branches, list):
+        errors.append("rejected_branches must be a list")
+
+    if not isinstance(summary["outcome"], str) or not summary["outcome"].strip():
+        errors.append("outcome must be a non-empty string")
+
+    return errors
+
+
 def _summarize_one(
     engine: OpenAICompatibleEngine,
     annotation_id: str,
     trajectory_samples: list[dict],
     max_tokens: int,
+    experience_version: str,
 ) -> dict:
     first = trajectory_samples[0]
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        task=first.get("confirmed_task", ""),
-        website=first.get("website", ""),
-        domain=first.get("domain", ""),
-        subdomain=first.get("subdomain", ""),
-        steps_block=_format_steps_block(trajectory_samples),
-    )
+    if experience_version == "v2":
+        system_prompt = V2_SYSTEM_PROMPT
+        user_prompt = V2_USER_PROMPT_TEMPLATE.format(
+            task=first.get("confirmed_task", ""),
+            website=first.get("website", ""),
+            domain=first.get("domain", ""),
+            subdomain=first.get("subdomain", ""),
+            steps_block=_format_steps_block(trajectory_samples),
+        )
+        validator = _validate_v2_summary
+    else:
+        system_prompt = V1_SYSTEM_PROMPT
+        user_prompt = V1_USER_PROMPT_TEMPLATE.format(
+            task=first.get("confirmed_task", ""),
+            website=first.get("website", ""),
+            domain=first.get("domain", ""),
+            subdomain=first.get("subdomain", ""),
+            steps_block=_format_steps_block(trajectory_samples),
+        )
+        validator = _validate_v1_summary
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     raw = engine.chat(messages, max_tokens=max_tokens)
     summary = _extract_json_object(raw)
-    errors = _validate_summary(summary)
+    errors = validator(summary)
     if errors:
         raise ValueError(f"summary validation failed: {errors}")
 
@@ -283,6 +453,7 @@ def _summarize_one(
         "domain": first.get("domain", ""),
         "subdomain": first.get("subdomain", ""),
         "num_steps": len(trajectory_samples),
+        "experience_version": experience_version,
         "summary": summary,
     }
 
@@ -311,6 +482,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rate-limit", type=int, default=30)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=1200)
+    parser.add_argument(
+        "--experience-version",
+        default="v1",
+        choices=["v1", "v2"],
+        help="Summary schema/prompt version for experience extraction.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Max annotations to summarize.")
     parser.add_argument(
         "--sample-size",
@@ -383,7 +560,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
             try:
-                record = _summarize_one(engine, annotation_id, trajectory, args.max_tokens)
+                record = _summarize_one(
+                    engine,
+                    annotation_id,
+                    trajectory,
+                    args.max_tokens,
+                    args.experience_version,
+                )
             except Exception as exc:
                 failures += 1
                 logger.warning(

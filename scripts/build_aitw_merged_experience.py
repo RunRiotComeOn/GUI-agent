@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-b-rate-limit", type=int, default=20)
     parser.add_argument("--stage-a-max-tokens", type=int, default=1200)
     parser.add_argument("--stage-b-max-tokens", type=int, default=3000)
+    parser.add_argument(
+        "--experience-version",
+        default="v1",
+        choices=["v1", "v2"],
+        help="Stage A/B experience extraction version.",
+    )
     parser.add_argument("--stage-a-max-steps", type=int, default=30)
     parser.add_argument("--stage-b-chunk-size", type=int, default=50)
     parser.add_argument("--support-threshold", type=int, default=3)
@@ -168,6 +174,8 @@ def main() -> int:
         str(args.stage_a_rate_limit),
         "--max-tokens",
         str(args.stage_a_max_tokens),
+        "--experience-version",
+        args.experience_version,
         "--max-steps",
         str(args.stage_a_max_steps),
         "--sample-size",
@@ -202,6 +210,8 @@ def main() -> int:
         str(args.stage_b_chunk_size),
         "--max-tokens",
         str(args.stage_b_max_tokens),
+        "--experience-version",
+        args.experience_version,
         "--support-threshold",
         str(args.support_threshold),
         "--catalog-cap",

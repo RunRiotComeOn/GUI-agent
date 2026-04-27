@@ -38,7 +38,7 @@ CANDIDATE_REQUIRED_FIELDS = (
 CONTEXT_REQUIRED_FIELDS = ("when", "ui_signals", "domain_hint")
 
 
-SYSTEM_PROMPT = """You are a pattern extractor for a GUI-agent experience
+V1_SYSTEM_PROMPT = """You are a pattern extractor for a GUI-agent experience
 library. You are given a batch of causal summaries distilled from successful
 trajectories. Your job is to propose reusable *experience* entries that
 capture UI interaction heuristics — patterns that prevent concrete agent
@@ -137,7 +137,7 @@ Other rules:
 """
 
 
-CONSOLIDATOR_SYSTEM_PROMPT = """You are consolidating candidate experience
+V1_CONSOLIDATOR_SYSTEM_PROMPT = """You are consolidating candidate experience
 entries that were extracted independently from different chunks of a
 trajectory summary buffer. Many candidates describe the SAME underlying
 UI interaction pattern with different wording.
@@ -196,6 +196,93 @@ Rules:
 """
 
 
+V2_SYSTEM_PROMPT = """You are a pattern extractor for a GUI-agent experience
+library. You are given a batch of experience-oriented turning-point summaries
+distilled from successful trajectories. Your job is to propose reusable
+experience entries that capture concrete GUI state-transition rules.
+
+Output strict JSON only (no markdown fences) with this schema:
+
+{
+  "candidates": [
+    {
+      "proposed_id": "short_snake_case_slug",
+      "title": "<= 10 word title describing the GUI rule",
+      "applicable_context": {
+        "when": "one sentence describing the triggering UI situation",
+        "ui_signals": ["concrete visible cues from the active state"],
+        "domain_hint": "generic | travel | shopping | info | entertainment | service"
+      },
+      "action_guidance": "one short paragraph explaining what to do and why now",
+      "action_templates": ["<= 2 short templates, optional, empty list if none"],
+      "supporting_trajectories": ["T012", "T037", "T089"],
+      "trigger_ui_state": "short phrase for the pre-state",
+      "forbidden_alternative": "tempting wrong action to avoid",
+      "expected_postcondition": "what should become committed after the action",
+      "confidence": 0.0
+    }
+  ]
+}
+
+Selection rules:
+- Prefer rules grounded in pre_state, commit_signal, post_state, and
+  failure_if_skipped from the summaries.
+- A rule MUST prevent a concrete GUI mistake like leaving a picker without
+  confirming, clicking outside an active modal, or advancing while state is
+  still pending.
+- Reject pure task skeletons and generic workflow summaries.
+- Keep the causal direction correct: trigger on the UI state that is active
+  now, then recommend the next interaction that resolves it.
+- supporting_trajectories MUST use exact T### handles from input.
+- A candidate MUST be supported by at least 2 trajectories in this chunk.
+- If no genuinely reusable GUI rule exists, return {"candidates": []}.
+"""
+
+
+V2_CONSOLIDATOR_SYSTEM_PROMPT = """You are consolidating candidate GUI-rule
+experiences extracted from different chunks of an experience summary buffer.
+Many candidates describe the same underlying state-transition rule with
+different wording.
+
+Your job:
+  1. Merge semantically duplicate GUI rules.
+  2. Keep the strongest trigger wording and clearest failure mode.
+  3. DROP any candidate that is only a task skeleton or generic workflow tip.
+  4. DROP any group whose unioned supporting_trajectories has fewer than 3
+     unique T### handles.
+
+Output strict JSON only (no markdown fences):
+
+{
+  "consolidated": [
+    {
+      "proposed_id": "short_snake_case_slug",
+      "title": "<= 10 word GUI-rule title",
+      "applicable_context": {
+        "when": "triggering UI situation",
+        "ui_signals": ["..."],
+        "domain_hint": "generic | travel | shopping | info | entertainment | service"
+      },
+      "action_guidance": "what to do and why",
+      "action_templates": ["<= 2 templates, optional"],
+      "supporting_trajectories": ["T012", "T037", "T089"],
+      "prevents_mistake": "concrete agent mistake this rule prevents",
+      "trigger_ui_state": "short phrase for the pre-state",
+      "forbidden_alternative": "tempting wrong action to avoid",
+      "expected_postcondition": "what should become committed after the action",
+      "merged_from": ["exp_xxx_candidate_id_1", "exp_xxx_candidate_id_2"]
+    }
+  ]
+}
+
+Rules:
+- supporting_trajectories MUST be the union of source handles.
+- merged_from lists the source proposed_id values.
+- prevents_mistake is REQUIRED and must name a concrete failure mode.
+- Keep the rule at the interaction-pattern level, not the site-specific task level.
+"""
+
+
 USER_PROMPT_TEMPLATE = """Batch of {n} causal summaries.
 
 Each summary is rendered compactly. T### is the trajectory handle — use it
@@ -216,7 +303,7 @@ Consolidate these into the canonical list. Apply K>=3 on the unioned
 supporting_trajectories. Drop task skeletons. Output the JSON."""
 
 
-def _compact_encode(idx: int, record: dict) -> str:
+def _compact_encode_v1(idx: int, record: dict) -> str:
     s = record["summary"]
     handle = f"T{idx:03d}"
     domain = record.get("domain", "")
@@ -249,6 +336,63 @@ def _compact_encode(idx: int, record: dict) -> str:
     else:
         lines.append("  turning_points: (none)")
     return "\n".join(lines)
+
+
+def _compact_encode_v2(idx: int, record: dict) -> str:
+    s = record["summary"]
+    handle = f"T{idx:03d}"
+    domain = record.get("domain", "")
+    subdomain = record.get("subdomain", "")
+    goal = s.get("goal", "")
+    task_shape = s.get("task_shape", "")
+    lines = [
+        f"[{handle}] domain={domain}/{subdomain}",
+        f"  goal: {goal}",
+        f"  task_shape: {task_shape}",
+    ]
+    turning_points = s.get("turning_points") or []
+    if not turning_points:
+        lines.append("  turning_points: (none)")
+        return "\n".join(lines)
+
+    lines.append("  turning_points:")
+    for tp in turning_points:
+        step = tp.get("step", "?")
+        pre = tp.get("pre_state") or {}
+        action = tp.get("action") or {}
+        post = tp.get("post_state") or {}
+        commit_signal = tp.get("commit_signal") or []
+        lines.extend([
+            f"    step {step}: pattern={tp.get('generalizable_pattern', '')}",
+            (
+                "      pre_state: "
+                f"ui_context={pre.get('ui_context', '')}; "
+                f"active_subflow={pre.get('active_subflow', '')}; "
+                f"recent_user_commit={pre.get('recent_user_commit', '')}; "
+                f"pending_commit={pre.get('pending_commit', False)}"
+            ),
+            (
+                "      action: "
+                f"{action.get('op', '')} target={action.get('target', '')} "
+                f"role={action.get('target_role', '')}"
+            ),
+            f"      commit_signal: {'; '.join(commit_signal) if commit_signal else '(none)'}",
+            (
+                "      post_state: "
+                f"state_change={post.get('state_change', '')}; "
+                f"subflow_status={post.get('subflow_status', '')}"
+            ),
+            f"      failure_if_skipped: {tp.get('failure_if_skipped', '')}",
+        ])
+    rejected = s.get("rejected_branches") or []
+    lines.append(f"  rejected_branches: {'; '.join(rejected) if rejected else '(none)'}")
+    return "\n".join(lines)
+
+
+def _compact_encode(idx: int, record: dict, experience_version: str) -> str:
+    if experience_version == "v2":
+        return _compact_encode_v2(idx, record)
+    return _compact_encode_v1(idx, record)
 
 
 def _extract_json_object(text: str) -> dict:
@@ -308,11 +452,13 @@ def _propose_from_chunk(
     chunk: list[tuple[int, dict]],
     handle_to_annotation: dict[str, str],
     max_tokens: int,
+    experience_version: str,
 ) -> list[dict]:
-    summaries_block = "\n\n".join(_compact_encode(idx, rec) for idx, rec in chunk)
+    summaries_block = "\n\n".join(_compact_encode(idx, rec, experience_version) for idx, rec in chunk)
     user_prompt = USER_PROMPT_TEMPLATE.format(n=len(chunk), summaries_block=summaries_block)
+    system_prompt = V2_SYSTEM_PROMPT if experience_version == "v2" else V1_SYSTEM_PROMPT
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     raw = engine.chat(messages, max_tokens=max_tokens)
@@ -354,6 +500,12 @@ def _compact_candidate(candidate: dict) -> str:
     ]
     if templates:
         lines.append(f"  templates: {templates}")
+    if candidate.get("trigger_ui_state"):
+        lines.append(f"  trigger_ui_state: {candidate['trigger_ui_state']}")
+    if candidate.get("forbidden_alternative"):
+        lines.append(f"  forbidden_alternative: {candidate['forbidden_alternative']}")
+    if candidate.get("expected_postcondition"):
+        lines.append(f"  expected_postcondition: {candidate['expected_postcondition']}")
     return "\n".join(lines)
 
 
@@ -363,6 +515,7 @@ def _consolidate_candidates(
     n_chunks: int,
     handle_to_annotation: dict[str, str],
     max_tokens: int,
+    experience_version: str,
 ) -> list[dict]:
     if not candidates:
         return []
@@ -374,8 +527,12 @@ def _consolidate_candidates(
     user_prompt = CONSOLIDATOR_USER_TEMPLATE.format(
         n_chunks=n_chunks, candidates_block=candidates_block
     )
+    system_prompt = (
+        V2_CONSOLIDATOR_SYSTEM_PROMPT if experience_version == "v2"
+        else V1_CONSOLIDATOR_SYSTEM_PROMPT
+    )
     messages = [
-        {"role": "system", "content": CONSOLIDATOR_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     raw = engine.chat(messages, max_tokens=max_tokens)
@@ -415,6 +572,9 @@ def _consolidate_candidates(
             "action_templates": templates,
             "supporting_annotations": annotations,
             "prevents_mistake": entry["prevents_mistake"],
+            "trigger_ui_state": entry.get("trigger_ui_state", ""),
+            "forbidden_alternative": entry.get("forbidden_alternative", ""),
+            "expected_postcondition": entry.get("expected_postcondition", ""),
             "merged_from": merged_from,
             "confidence": float(entry.get("confidence") or 0.0),
         })
@@ -463,6 +623,9 @@ def _finalize_library_record(
         "action_guidance": candidate["action_guidance"],
         "action_templates": candidate.get("action_templates") or [],
         "prevents_mistake": candidate.get("prevents_mistake", ""),
+        "trigger_ui_state": candidate.get("trigger_ui_state", ""),
+        "forbidden_alternative": candidate.get("forbidden_alternative", ""),
+        "expected_postcondition": candidate.get("expected_postcondition", ""),
         "evidence": {
             "support_count": len(support_set),
             "supporting_trajectories": sorted(support_set),
@@ -546,6 +709,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rate-limit", type=int, default=20)
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--max-tokens", type=int, default=3000)
+    parser.add_argument(
+        "--experience-version",
+        default="v1",
+        choices=["v1", "v2"],
+        help="Pattern extraction schema/prompt version.",
+    )
     parser.add_argument("--support-threshold", type=int, default=3, help="K in §3.2")
     parser.add_argument("--catalog-cap", type=int, default=50)
 
@@ -580,7 +749,13 @@ def main(argv: list[str] | None = None) -> int:
         chunk = indexed[start : start + args.chunk_size]
         logger.info("proposing from chunk %d-%d (size=%d)", start + 1, start + len(chunk), len(chunk))
         try:
-            candidates = _propose_from_chunk(engine, chunk, handle_to_annotation, args.max_tokens)
+            candidates = _propose_from_chunk(
+                engine,
+                chunk,
+                handle_to_annotation,
+                args.max_tokens,
+                args.experience_version,
+            )
         except Exception as exc:
             logger.warning("chunk %d-%d failed: %s", start + 1, start + len(chunk), exc)
             continue
@@ -591,7 +766,12 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("consolidating %d candidates from %d chunks via LLM", len(all_candidates), n_chunks)
     try:
         consolidated = _consolidate_candidates(
-            engine, all_candidates, n_chunks, handle_to_annotation, args.max_tokens
+            engine,
+            all_candidates,
+            n_chunks,
+            handle_to_annotation,
+            args.max_tokens,
+            args.experience_version,
         )
     except Exception as exc:
         logger.warning("consolidator LLM failed (%s); falling back to raw candidates", exc)

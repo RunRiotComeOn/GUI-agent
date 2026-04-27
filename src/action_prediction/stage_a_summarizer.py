@@ -194,6 +194,7 @@ def _load_stage_a_samples(
         websites=websites,
         domains=domains,
         dataset_format=dataset_format,
+        decode_images=False,
     )
 
 
@@ -474,6 +475,11 @@ def main(argv: list[str] | None = None) -> int:
         help="JSONL buffer. Re-runs skip annotation_ids already present.",
     )
     parser.add_argument("--model", default="gpt-4o-mini")
+    parser.add_argument(
+        "--experience-version",
+        default=None,
+        help="Compatibility flag from older launch commands; accepted but unused.",
+    )
     parser.add_argument(
         "--api-base",
         default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),

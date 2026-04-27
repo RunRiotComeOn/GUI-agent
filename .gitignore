@@ -13,3 +13,4 @@ outputs/
 tmp_*.txt
 *.sbatch
 _pycache_/
+.cache/

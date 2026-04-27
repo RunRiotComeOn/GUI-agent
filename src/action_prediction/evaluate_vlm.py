@@ -155,6 +155,89 @@ class OpenAICompatibleVLMEngine:
 
 class VLMActionEvaluator(ActionEvaluatorMultiChoice):
     @staticmethod
+    def write_mind2web_checkpoint(
+        output_path,
+        name,
+        top_k,
+        all_final_predictions,
+        result,
+        all_outputs,
+        all_experience_selections,
+    ):
+        os.makedirs(output_path, exist_ok=True)
+        with open(f"{output_path}/{name}_predictions_top{top_k}.json", "w", encoding="utf-8") as f:
+            json.dump(all_final_predictions, f)
+        with open(f"{output_path}/{name}_results_top{top_k}.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=4)
+        with open(f"{output_path}/{name}_outputs_top{top_k}.json", "w", encoding="utf-8") as f:
+            json.dump(all_outputs, f)
+        if all_experience_selections and any(
+            s.get("experience_id") is not None or s.get("reason") for s in all_experience_selections
+        ):
+            with open(
+                f"{output_path}/{name}_experience_selections_top{top_k}.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(all_experience_selections, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def build_mind2web_result(
+        all_element_acc,
+        all_action_f1,
+        all_step_acc,
+        sample_to_website,
+    ):
+        macro_element_acc = collections.defaultdict(list)
+        macro_action_f1 = collections.defaultdict(list)
+        macro_step_acc = collections.defaultdict(list)
+        for score, annotation_id in all_element_acc:
+            macro_element_acc[annotation_id].append(score)
+        for score, annotation_id in all_action_f1:
+            macro_action_f1[annotation_id].append(score)
+        for score, annotation_id in all_step_acc:
+            macro_step_acc[annotation_id].append(score)
+
+        error_ratio = collections.defaultdict(int)
+        acc_per_website = collections.defaultdict(list)
+        for annotation_id, values in macro_step_acc.items():
+            acc_per_website[sample_to_website[annotation_id]].append(sum(values) / len(values))
+            error_count = len([value for value in values if value == 0])
+            if error_count <= 3:
+                error_ratio[error_count] += 1
+            else:
+                error_ratio[">3"] += 1
+        if macro_element_acc:
+            error_ratio = {k: v / len(macro_element_acc) for k, v in error_ratio.items()}
+            acc_per_website = {k: (sum(v) / len(v), len(v)) for k, v in acc_per_website.items()}
+            macro_element_acc_value = sum(sum(v) / len(v) for v in macro_element_acc.values()) / len(
+                macro_element_acc
+            )
+            macro_action_f1_value = sum(sum(v) / len(v) for v in macro_action_f1.values()) / len(
+                macro_action_f1
+            )
+            macro_step_acc_value = sum(sum(v) / len(v) for v in macro_step_acc.values()) / len(
+                macro_step_acc
+            )
+        else:
+            acc_per_website = {}
+            macro_element_acc_value = 0.0
+            macro_action_f1_value = 0.0
+            macro_step_acc_value = 0.0
+            error_ratio = {}
+
+        return {
+            "element_acc": sum(x[0] for x in all_element_acc) / max(len(all_element_acc), 1),
+            "action_f1": sum(x[0] for x in all_action_f1) / max(len(all_action_f1), 1),
+            "step_acc": sum(x[0] for x in all_step_acc) / max(len(all_step_acc), 1),
+            "marco_element_acc": macro_element_acc_value,
+            "marco_action_f1": macro_action_f1_value,
+            "marco_step_acc": macro_step_acc_value,
+            "error_ratio": error_ratio,
+            "acc_per_website": acc_per_website,
+        }
+
+    @staticmethod
     def load_cross_task_memory_bank(path):
         if not path:
             return []
@@ -378,10 +461,18 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
         all_predictions = []
         all_outputs = []
         all_experience_selections = []
-        for sample in dataset.data:
+        total_samples = len(dataset.data)
+        for sample_idx, sample in enumerate(dataset.data, start=1):
             annotation_id = sample["annotation_id"]
             sample_id = f"{sample['annotation_id']}_{sample['action_uid']}"
             sample_to_website[annotation_id] = sample["website"]
+            logger.info(
+                "[%d/%d] evaluating sample=%s website=%s",
+                sample_idx,
+                total_samples,
+                sample_id,
+                sample.get("website", ""),
+            )
 
             history_images = []
             history_text = ""
@@ -496,6 +587,13 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
                     },
                 ]
             )
+            logger.info(
+                "[%d/%d] done sample=%s step_score=%.3f",
+                sample_idx,
+                total_samples,
+                sample_id,
+                step_score,
+            )
 
         result = self.build_aitw_result_summary(all_step_scores, sample_to_website)
         if output_path is not None:
@@ -573,253 +671,253 @@ class VLMActionEvaluator(ActionEvaluatorMultiChoice):
         ) / max(len(dataset.data), 1)
         logger.info("Candidate generator acc: %.4f", acc)
 
-        for sample in dataset.data:
+        total_samples = len(dataset.data)
+        for sample_idx, sample in enumerate(dataset.data, start=1):
             annotation_id = sample["annotation_id"]
+            sample_id = f"{sample['annotation_id']}_{sample['action_uid']}"
             sample_to_website[annotation_id] = sample["website"]
             hybrid_history_text = ""
             hybrid_selected_previous_steps = []
             hybrid_history_images = []
-            cross_task_memory_items = self.retrieve_cross_task_memory(
-                sample=sample,
-                memory_bank=cross_task_memory_bank or [],
-                top_k=cross_task_memory_top_k,
+            logger.info(
+                "[%d/%d] evaluating sample=%s website=%s",
+                sample_idx,
+                total_samples,
+                sample_id,
+                sample.get("website", ""),
             )
-            cross_task_memory_text = self.build_cross_task_memory_text(cross_task_memory_items)
-
-            active_experience_text = ""
-            experience_selection = {"experience_id": None, "reason": "", "injection": None}
-            if experience_catalog and experience_library and experience_selector_engine is not None:
-                sel_task, sel_recent, sel_obs = build_context_for_sample(sample)
-                try:
-                    experience_selection = select_experience(
-                        engine=experience_selector_engine,
-                        task=sel_task,
-                        recent_steps=sel_recent,
-                        current_obs=sel_obs,
-                        catalog=experience_catalog,
-                        library=experience_library,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "experience selector failed on annotation=%s action=%s: %s",
-                        sample.get("annotation_id"), sample.get("action_uid"), exc,
-                    )
-                if experience_selection.get("injection"):
-                    active_experience_text = experience_selection["injection"]
-            all_experience_selections.append({
-                "annotation_id": sample["annotation_id"],
-                "action_uid": sample["action_uid"],
-                "target_action_index": sample.get("target_action_index"),
-                "experience_id": experience_selection.get("experience_id"),
-                "reason": experience_selection.get("reason", ""),
-            })
-
-            if history_mode == "agentic_summary_recent":
-                if memory_engine is None:
-                    raise ValueError("memory_engine is required for history_mode=agentic_summary_recent")
-                (
-                    hybrid_history_text,
-                    hybrid_selected_previous_steps,
-                    hybrid_history_images,
-                ) = self.build_agentic_summary_plus_recent_history(
+            try:
+                cross_task_memory_items = self.retrieve_cross_task_memory(
                     sample=sample,
-                    memory_engine=memory_engine,
-                    history_text_char_budget=history_text_char_budget,
-                    recent_k=recent_k,
-                    recent_k_policy=recent_k_policy,
+                    memory_bank=cross_task_memory_bank or [],
+                    top_k=cross_task_memory_top_k,
                 )
+                cross_task_memory_text = self.build_cross_task_memory_text(cross_task_memory_items)
 
-            pos_candidates = [c for c in sample["pos_candidates"] if c["rank"] < top_k]
-            pos_ids = [c["backend_node_id"] for c in pos_candidates]
-            if len(pos_ids) == 0:
-                all_element_acc.append([0, annotation_id])
-                all_action_f1.append([0, annotation_id])
-                all_step_acc.append([0, annotation_id])
-                all_final_predictions.append(
-                    [f"{sample['annotation_id']}_{sample['action_uid']}", "", ""]
-                )
-                all_outputs.append(
-                    [f"{sample['annotation_id']}_{sample['action_uid']}", []]
-                )
-                continue
-
-            _, _, target_out, _ = format_input_multichoice(sample, pos_ids[:1], pos_ids[0])
-            _, target_action = self.postprocess_action(target_out)
-            neg_candidates = [c for c in sample["neg_candidates"] if c["rank"] < top_k]
-            neg_ids = [c["backend_node_id"] for c in neg_candidates]
-            all_candidates = pos_ids + neg_ids
-            random.shuffle(all_candidates)
-            final_prediction = None
-            outputs = []
-
-            while len(all_candidates) > 1:
-                candidate_ids = all_candidates[:5]
-                all_candidates = all_candidates[5:]
-                seq_context, seq_in, _, choices = format_input_multichoice(
-                    sample, candidate_ids, -1, keep_html_brackets=True
-                )
-                prompt = copy.deepcopy(prompt_template)
-                prompt[-1]["content"] = f"'''\n{seq_context}\n'''\n\n{seq_in}"
-                history_images = []
-                history_text = ""
-                effective_recent_k = self.resolve_recent_k(sample, recent_k, recent_k_policy)
-                selected_previous_steps = self.select_previous_steps(sample, history_mode, recent_k, recent_k_policy)
-                if history_mode != "none":
-                    if history_mode == "agentic_summary_recent":
-                        history_text = hybrid_history_text
-                        selected_previous_steps = hybrid_selected_previous_steps
-                        history_images = hybrid_history_images
-                    else:
-                        history_text = self.build_history_text(
-                            sample, selected_previous_steps, history_text_char_budget
-                        )
-                    if use_image and history_mode == "full":
-                        history_images = [
-                            step["screenshot"]
-                            for step in selected_previous_steps
-                            if step.get("screenshot") is not None
-                        ]
-                if cross_task_memory_text:
-                    history_text = (
-                        f"{history_text}\n\n{cross_task_memory_text}"
-                        if history_text
-                        else cross_task_memory_text
-                    )
-                if active_experience_text:
-                    history_text = (
-                        f"{history_text}\n\n{active_experience_text}"
-                        if history_text
-                        else active_experience_text
-                    )
-                outputs.append(
-                    [
-                        candidate_ids,
-                        [seq_context, seq_in, choices],
-                        {
-                            "history_mode": history_mode,
-                            "recent_k_policy": recent_k_policy,
-                            "effective_recent_k": effective_recent_k,
-                            "cross_task_memory_count": len(cross_task_memory_items),
-                            "history_text": history_text,
-                            "history_image_count": len(history_images),
-                            "selected_previous_steps": len(selected_previous_steps),
-                        },
-                        None,
-                    ]
-                )
-                output = model.generate(
-                    prompt=prompt,
-                    max_new_tokens=50,
-                    image=sample["screenshot"] if use_image else None,
-                    history_images=history_images,
-                    history_text=history_text,
-                )
-                outputs[-1][-1] = output[0]
-                pred_element, pred_action = self.postprocess_action_llm(output[0])
-                if pred_element[0] != "A":
-                    pred_element = ord(pred_element[0]) - ord("B")
+                active_experience_text = ""
+                experience_selection = {"experience_id": None, "reason": "", "injection": None}
+                if experience_catalog and experience_library and experience_selector_engine is not None:
+                    sel_task, sel_recent, sel_obs = build_context_for_sample(sample)
                     try:
-                        pred_element = choices[pred_element][0]
-                        all_candidates.append(pred_element)
-                        final_prediction = (pred_element, pred_action)
-                    except IndexError:
-                        logger.info("IndexError for output=%s", output[0])
-                        final_prediction = None
+                        experience_selection = select_experience(
+                            engine=experience_selector_engine,
+                            task=sel_task,
+                            recent_steps=sel_recent,
+                            current_obs=sel_obs,
+                            catalog=experience_catalog,
+                            library=experience_library,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "experience selector failed on annotation=%s action=%s: %s",
+                            sample.get("annotation_id"), sample.get("action_uid"), exc,
+                        )
+                    if experience_selection.get("injection"):
+                        active_experience_text = experience_selection["injection"]
+                all_experience_selections.append({
+                    "annotation_id": sample["annotation_id"],
+                    "action_uid": sample["action_uid"],
+                    "target_action_index": sample.get("target_action_index"),
+                    "experience_id": experience_selection.get("experience_id"),
+                    "reason": experience_selection.get("reason", ""),
+                })
 
-            all_outputs.append([f"{sample['annotation_id']}_{sample['action_uid']}", outputs])
-            if len(all_candidates) == 0 or final_prediction is None:
+                if history_mode == "agentic_summary_recent":
+                    if memory_engine is None:
+                        raise ValueError("memory_engine is required for history_mode=agentic_summary_recent")
+                    (
+                        hybrid_history_text,
+                        hybrid_selected_previous_steps,
+                        hybrid_history_images,
+                    ) = self.build_agentic_summary_plus_recent_history(
+                        sample=sample,
+                        memory_engine=memory_engine,
+                        history_text_char_budget=history_text_char_budget,
+                        recent_k=recent_k,
+                        recent_k_policy=recent_k_policy,
+                    )
+
+                pos_candidates = [c for c in sample["pos_candidates"] if c["rank"] < top_k]
+                pos_ids = [c["backend_node_id"] for c in pos_candidates]
+                if len(pos_ids) == 0:
+                    all_element_acc.append([0, annotation_id])
+                    all_action_f1.append([0, annotation_id])
+                    all_step_acc.append([0, annotation_id])
+                    all_final_predictions.append([sample_id, "", ""])
+                    all_outputs.append([sample_id, []])
+                    logger.info("[%d/%d] done sample=%s no-positive-candidates", sample_idx, total_samples, sample_id)
+                    continue
+
+                _, _, target_out, _ = format_input_multichoice(sample, pos_ids[:1], pos_ids[0])
+                _, target_action = self.postprocess_action(target_out)
+                neg_candidates = [c for c in sample["neg_candidates"] if c["rank"] < top_k]
+                neg_ids = [c["backend_node_id"] for c in neg_candidates]
+                all_candidates = pos_ids + neg_ids
+                random.shuffle(all_candidates)
+                final_prediction = None
+                outputs = []
+
+                while len(all_candidates) > 1:
+                    candidate_ids = all_candidates[:5]
+                    all_candidates = all_candidates[5:]
+                    seq_context, seq_in, _, choices = format_input_multichoice(
+                        sample, candidate_ids, -1, keep_html_brackets=True
+                    )
+                    prompt = copy.deepcopy(prompt_template)
+                    prompt[-1]["content"] = f"'''\n{seq_context}\n'''\n\n{seq_in}"
+                    history_images = []
+                    history_text = ""
+                    effective_recent_k = self.resolve_recent_k(sample, recent_k, recent_k_policy)
+                    selected_previous_steps = self.select_previous_steps(sample, history_mode, recent_k, recent_k_policy)
+                    if history_mode != "none":
+                        if history_mode == "agentic_summary_recent":
+                            history_text = hybrid_history_text
+                            selected_previous_steps = hybrid_selected_previous_steps
+                            history_images = hybrid_history_images
+                        else:
+                            history_text = self.build_history_text(
+                                sample, selected_previous_steps, history_text_char_budget
+                            )
+                        if use_image and history_mode == "full":
+                            history_images = [
+                                step["screenshot"]
+                                for step in selected_previous_steps
+                                if step.get("screenshot") is not None
+                            ]
+                    if cross_task_memory_text:
+                        history_text = (
+                            f"{history_text}\n\n{cross_task_memory_text}"
+                            if history_text
+                            else cross_task_memory_text
+                        )
+                    if active_experience_text:
+                        history_text = (
+                            f"{history_text}\n\n{active_experience_text}"
+                            if history_text
+                            else active_experience_text
+                        )
+                    outputs.append(
+                        [
+                            candidate_ids,
+                            [seq_context, seq_in, choices],
+                            {
+                                "history_mode": history_mode,
+                                "recent_k_policy": recent_k_policy,
+                                "effective_recent_k": effective_recent_k,
+                                "cross_task_memory_count": len(cross_task_memory_items),
+                                "history_text": history_text,
+                                "history_image_count": len(history_images),
+                                "selected_previous_steps": len(selected_previous_steps),
+                            },
+                            None,
+                        ]
+                    )
+                    output = model.generate(
+                        prompt=prompt,
+                        max_new_tokens=50,
+                        image=sample["screenshot"] if use_image else None,
+                        history_images=history_images,
+                        history_text=history_text,
+                    )
+                    outputs[-1][-1] = output[0]
+                    pred_element, pred_action = self.postprocess_action_llm(output[0])
+                    if pred_element[0] != "A":
+                        pred_element = ord(pred_element[0]) - ord("B")
+                        try:
+                            pred_element = choices[pred_element][0]
+                            all_candidates.append(pred_element)
+                            final_prediction = (pred_element, pred_action)
+                        except IndexError:
+                            logger.info("IndexError for output=%s", output[0])
+                            final_prediction = None
+
+                all_outputs.append([sample_id, outputs])
+                if len(all_candidates) == 0 or final_prediction is None:
+                    all_element_acc.append([0, annotation_id])
+                    all_action_f1.append([0, annotation_id])
+                    all_step_acc.append([0, annotation_id])
+                    all_final_predictions.append([sample_id, "", ""])
+                else:
+                    all_element_acc.append([1 if final_prediction[0] in pos_ids else 0, annotation_id])
+                    all_action_f1.append(
+                        [self.calculate_f1(final_prediction[1], target_action), annotation_id]
+                    )
+                    all_step_acc.append(
+                        [
+                            1
+                            if all_action_f1[-1][0] == 1 and all_element_acc[-1][0] == 1
+                            else 0,
+                            annotation_id,
+                        ]
+                    )
+                    all_final_predictions.append(
+                        [
+                            sample_id,
+                            final_prediction[0],
+                            final_prediction[1],
+                        ]
+                    )
+                logger.info(
+                    "[%d/%d] done sample=%s step_acc=%s",
+                    sample_idx,
+                    total_samples,
+                    sample_id,
+                    all_step_acc[-1][0],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%d/%d] sample=%s failed: %s",
+                    sample_idx,
+                    total_samples,
+                    sample_id,
+                    exc,
+                )
                 all_element_acc.append([0, annotation_id])
                 all_action_f1.append([0, annotation_id])
                 all_step_acc.append([0, annotation_id])
-                all_final_predictions.append(
-                    [f"{sample['annotation_id']}_{sample['action_uid']}", "", ""]
-                )
-            else:
-                all_element_acc.append([1 if final_prediction[0] in pos_ids else 0, annotation_id])
-                all_action_f1.append(
-                    [self.calculate_f1(final_prediction[1], target_action), annotation_id]
-                )
-                all_step_acc.append(
+                all_final_predictions.append([sample_id, "", ""])
+                all_outputs.append(
                     [
-                        1
-                        if all_action_f1[-1][0] == 1 and all_element_acc[-1][0] == 1
-                        else 0,
-                        annotation_id,
+                        sample_id,
+                        {
+                            "error": str(exc),
+                            "history_mode": history_mode,
+                        },
                     ]
                 )
-                all_final_predictions.append(
-                    [
-                        f"{sample['annotation_id']}_{sample['action_uid']}",
-                        final_prediction[0],
-                        final_prediction[1],
-                    ]
+            result = self.build_mind2web_result(
+                all_element_acc=all_element_acc,
+                all_action_f1=all_action_f1,
+                all_step_acc=all_step_acc,
+                sample_to_website=sample_to_website,
+            )
+            if output_path is not None:
+                self.write_mind2web_checkpoint(
+                    output_path=output_path,
+                    name=name,
+                    top_k=top_k,
+                    all_final_predictions=all_final_predictions,
+                    result=result,
+                    all_outputs=all_outputs,
+                    all_experience_selections=all_experience_selections,
                 )
 
-        macro_element_acc = collections.defaultdict(list)
-        macro_action_f1 = collections.defaultdict(list)
-        macro_step_acc = collections.defaultdict(list)
-        for score, annotation_id in all_element_acc:
-            macro_element_acc[annotation_id].append(score)
-        for score, annotation_id in all_action_f1:
-            macro_action_f1[annotation_id].append(score)
-        for score, annotation_id in all_step_acc:
-            macro_step_acc[annotation_id].append(score)
-
-        error_ratio = collections.defaultdict(int)
-        acc_per_website = collections.defaultdict(list)
-        for annotation_id, values in macro_step_acc.items():
-            acc_per_website[sample_to_website[annotation_id]].append(sum(values) / len(values))
-            error_count = len([value for value in values if value == 0])
-            if error_count <= 3:
-                error_ratio[error_count] += 1
-            else:
-                error_ratio[">3"] += 1
-        if macro_element_acc:
-            error_ratio = {k: v / len(macro_element_acc) for k, v in error_ratio.items()}
-            acc_per_website = {k: (sum(v) / len(v), len(v)) for k, v in acc_per_website.items()}
-            macro_element_acc_value = sum(sum(v) / len(v) for v in macro_element_acc.values()) / len(
-                macro_element_acc
-            )
-            macro_action_f1_value = sum(sum(v) / len(v) for v in macro_action_f1.values()) / len(
-                macro_action_f1
-            )
-            macro_step_acc_value = sum(sum(v) / len(v) for v in macro_step_acc.values()) / len(
-                macro_step_acc
-            )
-        else:
-            acc_per_website = {}
-            macro_element_acc_value = 0.0
-            macro_action_f1_value = 0.0
-            macro_step_acc_value = 0.0
-            error_ratio = {}
-
-        result = {
-            "element_acc": sum(x[0] for x in all_element_acc) / max(len(all_element_acc), 1),
-            "action_f1": sum(x[0] for x in all_action_f1) / max(len(all_action_f1), 1),
-            "step_acc": sum(x[0] for x in all_step_acc) / max(len(all_step_acc), 1),
-            "marco_element_acc": macro_element_acc_value,
-            "marco_action_f1": macro_action_f1_value,
-            "marco_step_acc": macro_step_acc_value,
-            "error_ratio": error_ratio,
-            "acc_per_website": acc_per_website,
-        }
+        result = self.build_mind2web_result(
+            all_element_acc=all_element_acc,
+            all_action_f1=all_action_f1,
+            all_step_acc=all_step_acc,
+            sample_to_website=sample_to_website,
+        )
         if output_path is not None:
-            os.makedirs(output_path, exist_ok=True)
-            with open(f"{output_path}/{name}_predictions_top{top_k}.json", "w", encoding="utf-8") as f:
-                json.dump(all_final_predictions, f)
-            with open(f"{output_path}/{name}_results_top{top_k}.json", "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=4)
-            with open(f"{output_path}/{name}_outputs_top{top_k}.json", "w", encoding="utf-8") as f:
-                json.dump(all_outputs, f)
-            if all_experience_selections and any(
-                s.get("experience_id") is not None or s.get("reason") for s in all_experience_selections
-            ):
-                with open(
-                    f"{output_path}/{name}_experience_selections_top{top_k}.json",
-                    "w",
-                    encoding="utf-8",
-                ) as f:
-                    json.dump(all_experience_selections, f, indent=2, ensure_ascii=False)
+            self.write_mind2web_checkpoint(
+                output_path=output_path,
+                name=name,
+                top_k=top_k,
+                all_final_predictions=all_final_predictions,
+                result=result,
+                all_outputs=all_outputs,
+                all_experience_selections=all_experience_selections,
+            )
         return result
 
 

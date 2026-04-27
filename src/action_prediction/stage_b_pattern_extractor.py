@@ -539,6 +539,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model", default="gpt-4o-mini")
     parser.add_argument(
+        "--experience-version",
+        default=None,
+        help="Compatibility flag from older launch commands; accepted but unused.",
+    )
+    parser.add_argument(
         "--api-base",
         default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
     )

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 import math
 
+from datasets import Image as HFImage
 from datasets import load_dataset
 from PIL import Image
 
@@ -457,8 +458,16 @@ def _build_previous_step_records(samples: list[dict]) -> None:
             history.append(sample.get("target_action_reprs", ""))
 
 
-def _load_dataset_rows(data_files: list[str], file_format: str) -> list[dict]:
+def _load_dataset_rows(
+    data_files: list[str],
+    file_format: str,
+    decode_images: bool = True,
+) -> list[dict]:
     dataset = load_dataset(file_format, data_files=data_files, split="train")
+    if not decode_images:
+        for column_name, feature in dataset.features.items():
+            if isinstance(feature, HFImage):
+                dataset = dataset.cast_column(column_name, HFImage(decode=False))
     return [dict(row) for row in dataset]
 
 
@@ -474,6 +483,7 @@ def load_multimodal_samples(
     websites: Iterable[str] | None = None,
     domains: Iterable[str] | None = None,
     dataset_format: str = "auto",
+    decode_images: bool = True,
 ) -> list[dict]:
     dataset_root = Path(dataset_path)
     if dataset_format == "auto":
@@ -488,13 +498,13 @@ def load_multimodal_samples(
     all_samples: list[dict] = []
     if dataset_format == "mind2web":
         data_files = _collect_mind2web_files(dataset_root, split)
-        for row in _load_dataset_rows(data_files, "parquet"):
+        for row in _load_dataset_rows(data_files, "parquet", decode_images=decode_images):
             all_samples.append(normalize_multimodal_sample(row))
     elif dataset_format == "aitw":
         data_files = _collect_aitw_files(dataset_root, split)
         for file_path in data_files:
             file_format = "parquet" if file_path.endswith(".parquet") else "json"
-            for row in _load_dataset_rows([file_path], file_format):
+            for row in _load_dataset_rows([file_path], file_format, decode_images=decode_images):
                 all_samples.append(normalize_aitw_sample(row, source_path=Path(file_path)))
     else:
         raise ValueError(f"Unsupported dataset_format={dataset_format!r}")
